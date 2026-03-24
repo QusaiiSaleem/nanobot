@@ -101,18 +101,17 @@ class MemoryStore:
         Tries Qmemory graph DB first (8,400+ memories with relationships).
         Falls back to flat MEMORY.md file if Qmemory is unavailable.
         """
-        # Try Qmemory first — async call wrapped in sync context
+        # Try Qmemory first — async call run in a separate thread
         try:
             import asyncio
+            import concurrent.futures
             from qmemory.core.recall import assemble_context
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                # We're inside an async context — create a task
-                import concurrent.futures
-                with concurrent.futures.ThreadPoolExecutor() as pool:
-                    result = pool.submit(asyncio.run, assemble_context("default")).result()
-            else:
-                result = asyncio.run(assemble_context("default"))
+
+            # Always use a thread + asyncio.run() — this works whether or not
+            # we're inside an existing event loop (NanoBot's gateway runs async)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(asyncio.run, assemble_context("default"))
+                result = future.result(timeout=10)
             if result:
                 return result
         except Exception as e:
