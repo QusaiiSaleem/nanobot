@@ -95,11 +95,15 @@ class MemoryStore:
         with open(self.history_file, "a", encoding="utf-8") as f:
             f.write(entry.rstrip() + "\n\n")
 
-    def get_memory_context(self) -> str:
+    def get_memory_context(self, session_key: str = "default") -> str:
         """Return memory for system prompt injection.
 
         Tries Qmemory graph DB first (8,400+ memories with relationships).
         Falls back to flat MEMORY.md file if Qmemory is unavailable.
+
+        Args:
+            session_key: Session identifier for topic-aware recall.
+                         e.g. "telegram:-1003655876469:topic:6" for a forum topic.
         """
         # Try Qmemory first — async call run in a separate thread
         try:
@@ -110,12 +114,12 @@ class MemoryStore:
             # Always use a thread + asyncio.run() — this works whether or not
             # we're inside an existing event loop (NanoBot's gateway runs async)
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                future = pool.submit(asyncio.run, assemble_context("default"))
+                future = pool.submit(asyncio.run, assemble_context(session_key))
                 result = future.result(timeout=10)
             if result:
                 return result
         except Exception as e:
-            logger.debug("Qmemory unavailable, falling back to MEMORY.md: {}", e)
+            logger.debug("Qmemory unavailable (session={}), falling back to MEMORY.md: {}", session_key, e)
 
         # Fallback: flat file
         long_term = self.read_long_term()

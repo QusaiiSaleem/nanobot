@@ -24,7 +24,7 @@ class ContextBuilder:
         self.memory = MemoryStore(workspace)
         self.skills = SkillsLoader(workspace)
 
-    def build_system_prompt(self, skill_names: list[str] | None = None) -> str:
+    def build_system_prompt(self, skill_names: list[str] | None = None, session_key: str = "default") -> str:
         """Build the system prompt from identity, bootstrap files, memory, and skills."""
         parts = [self._get_identity()]
 
@@ -32,7 +32,7 @@ class ContextBuilder:
         if bootstrap:
             parts.append(bootstrap)
 
-        memory = self.memory.get_memory_context()
+        memory = self.memory.get_memory_context(session_key)
         if memory:
             parts.append(f"# Memory\n\n{memory}")
 
@@ -133,6 +133,10 @@ IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST
         runtime_ctx = self._build_runtime_context(channel, chat_id)
         user_content = self._build_user_content(current_message, media)
 
+        # Build session key from channel + chat_id for topic-aware Qmemory recall.
+        # e.g. "telegram:-1003655876469:topic:6" or "telegram:1466200158"
+        session_key = f"{channel}:{chat_id}" if channel and chat_id else "default"
+
         # Merge runtime context and user content into a single user message
         # to avoid consecutive same-role messages that some providers reject.
         if isinstance(user_content, str):
@@ -141,7 +145,7 @@ IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST
             merged = [{"type": "text", "text": runtime_ctx}] + user_content
 
         return [
-            {"role": "system", "content": self.build_system_prompt(skill_names)},
+            {"role": "system", "content": self.build_system_prompt(skill_names, session_key=session_key)},
             *history,
             {"role": current_role, "content": merged},
         ]
