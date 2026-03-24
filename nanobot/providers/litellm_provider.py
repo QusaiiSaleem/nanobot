@@ -1,9 +1,11 @@
 """LiteLLM provider implementation for multi-provider support."""
 
 import hashlib
+import json
 import os
 import secrets
 import string
+import subprocess
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -19,6 +21,64 @@ from nanobot.providers.registry import find_by_model, find_gateway
 _ALLOWED_MSG_KEYS = frozenset({"role", "content", "tool_calls", "tool_call_id", "name", "reasoning_content"})
 _ANTHROPIC_EXTRA_KEYS = frozenset({"thinking_blocks"})
 _ALNUM = string.ascii_letters + string.digits
+
+# Anthropic OAuth: headers that identify as Claude Code to Anthropic's API.
+# Required for using Claude Max/Pro subscription tokens (sk-ant-oat01-*).
+_ANTHROPIC_OAUTH_PREFIX = "sk-ant-oat"
+_ANTHROPIC_OAUTH_HEADERS = {
+    "anthropic-beta": (
+        "claude-code-20250219,"
+        "oauth-2025-04-20,"
+        "prompt-caching-scope-2026-01-05,"
+        "interleaved-thinking-2025-05-14"
+    ),
+    "user-agent": "claude-cli/2.1.81",
+    "x-app": "cli",
+}
+_ANTHROPIC_OAUTH_SYSTEM_PREFIX = {
+    "type": "text",
+    "text": "You are Claude Code, Anthropic's official CLI for Claude.",
+}
+
+
+_ANTHROPIC_KEYCHAIN_SENTINEL = "keychain:claude-code"
+
+
+def _is_anthropic_oauth(api_key: str | None) -> bool:
+    """Detect Anthropic OAuth subscription tokens by prefix."""
+    return bool(api_key and (
+        api_key.startswith(_ANTHROPIC_OAUTH_PREFIX)
+        or api_key == _ANTHROPIC_KEYCHAIN_SENTINEL
+    ))
+
+
+def _resolve_oauth_token(api_key: str | None) -> str | None:
+    """Resolve OAuth token: read fresh from macOS Keychain if sentinel value, otherwise return as-is.
+
+    When config has `"apiKey": "keychain:claude-code"`, the token is read fresh
+    from macOS Keychain on every API call. Claude Code keeps the Keychain updated
+    with valid tokens, so no refresh logic is needed here.
+    """
+    if api_key != _ANTHROPIC_KEYCHAIN_SENTINEL:
+        return api_key
+    try:
+        raw = subprocess.check_output(
+            ["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],
+            stderr=subprocess.DEVNULL, text=True,
+        ).strip()
+        data = json.loads(raw)
+        oauth = data.get("claudeAiOauth", {})
+        if isinstance(oauth, str):
+            oauth = json.loads(oauth)
+        token = oauth.get("accessToken")
+        if token and token.startswith(_ANTHROPIC_OAUTH_PREFIX):
+            return token
+        logger.warning("Keychain token missing or invalid prefix")
+        return None
+    except Exception as e:
+        logger.warning("Failed to read Claude Code token from Keychain: {}", e)
+        return None
+
 
 def _short_tool_id() -> str:
     """Generate a 9-char alphanumeric ID compatible with all providers (incl. Mistral)."""
@@ -42,6 +102,18 @@ class LiteLLMProvider(LLMProvider):
         extra_headers: dict[str, str] | None = None,
         provider_name: str | None = None,
     ):
+        # For Anthropic OAuth: store the original config value (may be sentinel),
+        # and resolve once now for env var setup.
+        self._anthropic_oauth = _is_anthropic_oauth(api_key)
+        self._oauth_config_key = api_key if self._anthropic_oauth else None
+        if self._anthropic_oauth:
+            resolved = _resolve_oauth_token(api_key)
+            if resolved:
+                api_key = resolved
+                logger.info("Anthropic OAuth: token resolved successfully")
+            else:
+                logger.warning("Anthropic OAuth: failed to resolve token — API calls will fail")
+
         super().__init__(api_key, api_base)
         self.default_model = default_model
         self.extra_headers = extra_headers or {}
@@ -117,6 +189,26 @@ class LiteLLMProvider(LLMProvider):
         if prefix.lower().replace("-", "_") != spec_name:
             return model
         return f"{canonical_prefix}/{remainder}"
+
+    @staticmethod
+    def _prepend_oauth_system(kwargs: dict[str, Any]) -> None:
+        """Prepend Claude Code identity to system message for OAuth acceptance."""
+        msgs = kwargs.get("messages", [])
+        if not msgs:
+            return
+        first = msgs[0]
+        if first.get("role") == "system":
+            content = first.get("content")
+            if isinstance(content, str):
+                msgs[0] = {**first, "content": [
+                    _ANTHROPIC_OAUTH_SYSTEM_PREFIX,
+                    {"type": "text", "text": content},
+                ]}
+            elif isinstance(content, list):
+                msgs[0] = {**first, "content": [_ANTHROPIC_OAUTH_SYSTEM_PREFIX, *content]}
+        else:
+            # No system message — inject one at the start
+            msgs.insert(0, {"role": "system", "content": [_ANTHROPIC_OAUTH_SYSTEM_PREFIX]})
 
     def _supports_cache_control(self, model: str) -> bool:
         """Return True when the provider supports cache_control on content blocks."""
@@ -265,12 +357,27 @@ class LiteLLMProvider(LLMProvider):
         if self._langsmith_enabled:
             kwargs.setdefault("callbacks", []).append("langsmith")
 
-        if self.api_key:
+        # Merge extra_headers: config headers + OAuth headers (if applicable).
+        merged_headers = dict(self.extra_headers) if self.extra_headers else {}
+        is_oauth = _is_anthropic_oauth(self.api_key)
+
+        if is_oauth:
+            # Re-resolve token on each call (Keychain may have a fresher token).
+            token = _resolve_oauth_token(self._oauth_config_key or self.api_key)
+            if not token:
+                raise ValueError("Anthropic OAuth token unavailable — check Keychain or Claude Code login")
+            # LiteLLM sends token as x-api-key; Anthropic accepts it with oauth beta.
+            kwargs["api_key"] = token
+            merged_headers.update(_ANTHROPIC_OAUTH_HEADERS)
+            self._prepend_oauth_system(kwargs)
+            logger.debug("Anthropic OAuth: injected Claude Code headers")
+        elif self.api_key:
             kwargs["api_key"] = self.api_key
+
         if self.api_base:
             kwargs["api_base"] = self.api_base
-        if self.extra_headers:
-            kwargs["extra_headers"] = self.extra_headers
+        if merged_headers:
+            kwargs["extra_headers"] = merged_headers
 
         if reasoning_effort:
             kwargs["reasoning_effort"] = reasoning_effort
