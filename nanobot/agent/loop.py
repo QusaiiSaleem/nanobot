@@ -145,6 +145,21 @@ class AgentLoop:
         if self.cron_service:
             self.tools.register(CronTool(self.cron_service))
 
+        # Discover tool plugins registered via entry_points (same pattern as channels)
+        self._register_plugin_tools()
+
+    def _register_plugin_tools(self) -> None:
+        """Discover and register tool plugins from the 'nanobot.tools' entry point group."""
+        from importlib.metadata import entry_points
+
+        for ep in entry_points(group="nanobot.tools"):
+            try:
+                tool_cls = ep.load()
+                self.tools.register(tool_cls())
+                logger.info("Loaded tool plugin: {}", ep.name)
+            except Exception as e:
+                logger.warning("Failed to load tool plugin '{}': {}", ep.name, e)
+
     async def _connect_mcp(self) -> None:
         """Connect to configured MCP servers (one-time, lazy)."""
         if self._mcp_connected or self._mcp_connecting or not self._mcp_servers:
