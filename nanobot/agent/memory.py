@@ -96,6 +96,29 @@ class MemoryStore:
             f.write(entry.rstrip() + "\n\n")
 
     def get_memory_context(self) -> str:
+        """Return memory for system prompt injection.
+
+        Tries Qmemory graph DB first (8,400+ memories with relationships).
+        Falls back to flat MEMORY.md file if Qmemory is unavailable.
+        """
+        # Try Qmemory first — async call wrapped in sync context
+        try:
+            import asyncio
+            from qmemory.core.recall import assemble_context
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # We're inside an async context — create a task
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor() as pool:
+                    result = pool.submit(asyncio.run, assemble_context("default")).result()
+            else:
+                result = asyncio.run(assemble_context("default"))
+            if result:
+                return result
+        except Exception as e:
+            logger.debug("Qmemory unavailable, falling back to MEMORY.md: {}", e)
+
+        # Fallback: flat file
         long_term = self.read_long_term()
         return f"## Long-term Memory\n{long_term}" if long_term else ""
 
